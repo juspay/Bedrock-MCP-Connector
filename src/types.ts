@@ -1,6 +1,7 @@
 import { BedrockRuntimeClient } from "@aws-sdk/client-bedrock-runtime";
 import { MCPClient } from "mcp-client";
 import { EventEmitter } from "events";
+import { StorageConfig } from "./storage/types.js";
 
 /**
  * Configuration options for the Bedrock MCP Client
@@ -24,6 +25,12 @@ export interface BedrockMCPClientConfig {
     temperature?: number;
     /** Optional response output tags to extract specific content */
     responseOutputTags?: [string, string];
+    /** Storage configuration for conversation history (default: in-memory) */
+    storage?: StorageConfig;
+    /** Session identifier for conversation storage */
+    sessionId?: string;
+    /** User identifier for multi-user scenarios */
+    userId?: string;
 }
 
 /**

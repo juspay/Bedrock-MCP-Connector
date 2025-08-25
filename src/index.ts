@@ -7,6 +7,16 @@ export { ConverseAgent, ToolManager } from './core/index.js';
 // Export utilities
 export { Logger, LogLevel, createDefaultLogger } from './utils/index.js';
 
+// Export storage components
+export {
+    MessageStorage,
+    InMemoryMessageStorage,
+    RedisMessageStorage,
+    StorageConfig,
+    RedisStorageConfig,
+    SessionIdentifier
+} from './storage/index.js';
+
 // Export types
 export {
     BedrockMCPClientConfig,

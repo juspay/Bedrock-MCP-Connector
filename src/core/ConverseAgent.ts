@@ -2,6 +2,7 @@ import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-r
 import { Message, TextContent, ToolRequest, ToolResponse } from "../types.js";
 import { ToolManager } from "./ToolManager.js";
 import { Logger, LogLevel, createDefaultLogger } from "../utils/logging.js";
+import { MessageStorage, InMemoryMessageStorage, SessionIdentifier } from "../storage/index.js";
 
 /**
  * Agent for interacting with AWS Bedrock's Converse API
@@ -11,7 +12,8 @@ export class ConverseAgent {
     private region: string;
     private bedrockClient: BedrockRuntimeClient;
     private systemPrompt: string;
-    private messages: Message[];
+    private messageStorage: MessageStorage;
+    private session: SessionIdentifier;
     private toolManager: ToolManager | null;
     private responseOutputTags: [string, string] | [];
     private maxTokens: number;
@@ -20,7 +22,7 @@ export class ConverseAgent {
 
     /**
      * Create a new ConverseAgent
-     * 
+     *
      * @param modelId - The AWS Bedrock model ID to use
      * @param options - Configuration options
      */
@@ -33,6 +35,8 @@ export class ConverseAgent {
             responseOutputTags?: [string, string];
             maxTokens?: number;
             temperature?: number;
+            messageStorage?: MessageStorage;
+            session?: SessionIdentifier;
         } = {}
     ) {
         this.modelId = modelId;
@@ -49,13 +53,24 @@ export class ConverseAgent {
                                                     - If some questions require tools and others don't, **answer what you can immediately**, then use tools as needed.
                                                     - After using a tool, continue answering any remaining questions.
                                                     `;
-        this.messages = [];
+        
+        // Initialize storage and session
+        this.messageStorage = options.messageStorage || new InMemoryMessageStorage();
+        this.session = options.session || { sessionId: this.generateSessionId() };
+        
         this.toolManager = options.toolManager || null;
         this.responseOutputTags = options.responseOutputTags || [];
         this.maxTokens = options.maxTokens || 2000;
         this.temperature = options.temperature || 0.7;
         this.logger = createDefaultLogger('ConverseAgent');
         this.logger.setLevel(LogLevel.INFO); // Set to DEBUG to see all logs
+    }
+
+    /**
+     * Generate a unique session ID
+     */
+    private generateSessionId(): string {
+        return `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     }
 
     /**
@@ -71,7 +86,7 @@ export class ConverseAgent {
 
     /**
      * Invoke the agent with content
-     * 
+     *
      * @param content - The content to send
      * @returns A promise that resolves to the agent's response
      */
@@ -89,9 +104,10 @@ export class ConverseAgent {
 
             // For tool results, we need to add them to the last assistant message
             // First, check if we have an assistant message
+            const messages = await this.messageStorage.getMessages(this.session);
             let assistantMessageIndex = -1;
-            for (let i = this.messages.length - 1; i >= 0; i--) {
-                if (this.messages[i].role === "assistant") {
+            for (let i = messages.length - 1; i >= 0; i--) {
+                if (messages[i].role === "assistant") {
                     assistantMessageIndex = i;
                     break;
                 }
@@ -99,47 +115,51 @@ export class ConverseAgent {
 
             if (assistantMessageIndex >= 0) {
                 // Replace the assistant message with a new one containing the tool results
-                this.messages[assistantMessageIndex] = {
+                const updatedMessage: Message = {
                     role: "assistant",
                     content: content
                 };
+                await this.messageStorage.updateMessage(this.session, assistantMessageIndex, updatedMessage);
                 this.logger.debug("Updated assistant message with tool results");
             } else {
                 // If no assistant message found, add a new one
-                this.messages.push({
+                const newMessage: Message = {
                     role: "assistant",
                     content: content
-                });
+                };
+                await this.messageStorage.addMessage(this.session, newMessage);
                 this.logger.debug("Added new assistant message with tool results");
             }
         } else {
             // Regular user message
-            this.messages.push({
+            const userMessage: Message = {
                 role: "user",
                 content: content,
-            });
+            };
+            await this.messageStorage.addMessage(this.session, userMessage);
             this.logger.debug("Added user message");
         }
 
-        this.logger.debug("Sending message to model:", JSON.stringify(this.messages[this.messages.length - 1], null, 2));
+        const messages = await this.messageStorage.getMessages(this.session);
+        this.logger.debug("Sending message to model:", JSON.stringify(messages[messages.length - 1], null, 2));
         const response = await this._getConverseResponse();
         return await this._handleResponse(response);
     }
 
     /**
      * Get the conversation history
-     * 
+     *
      * @returns The conversation history
      */
-    getConversationHistory(): Message[] {
-        return [...this.messages];
+    async getConversationHistory(): Promise<Message[]> {
+        return await this.messageStorage.getMessages(this.session);
     }
 
     /**
      * Clear the conversation history
      */
-    clearConversationHistory(): void {
-        this.messages = [];
+    async clearConversationHistory(): Promise<void> {
+        await this.messageStorage.clearMessages(this.session);
     }
 
     /**
@@ -162,15 +182,18 @@ export class ConverseAgent {
 
     /**
      * Get a response from the Converse API
-     * 
+     *
      * @returns A promise that resolves to the Converse API response
      * @private
      */
     private async _getConverseResponse() {
+        // Get current messages from storage
+        const messages = await this.messageStorage.getMessages(this.session);
+        
         // Build the command input with system prompt, inference config, and (optionally) tool config
         const commandInput: any = {
             modelId: this.modelId,
-            messages: this.messages,
+            messages: messages,
             system: [{ text: this.systemPrompt }],
             inferenceConfig: {
                 maxTokens: this.maxTokens,
@@ -186,17 +209,17 @@ export class ConverseAgent {
         }
 
         // Log the full conversation history for debugging
-        this.logger.debug("Full conversation history:", JSON.stringify(this.messages, null, 2));
+        this.logger.debug("Full conversation history:", JSON.stringify(messages, null, 2));
 
         // Log the complete API payload for debugging
         this.logger.debug("CONVERSE API PAYLOAD:", JSON.stringify(commandInput, null, 2));
 
         // Log the exact structure of each message for debugging
         this.logger.debug("Message structure breakdown:");
-        this.messages.forEach((msg, index) => {
+        messages.forEach((msg: Message, index: number) => {
             this.logger.debug(`Message ${index} (${msg.role}):`);
             if (Array.isArray(msg.content)) {
-                msg.content.forEach((contentItem, contentIndex) => {
+                msg.content.forEach((contentItem: any, contentIndex: number) => {
                     this.logger.debug(`  Content item ${contentIndex} type: ${Object.keys(contentItem).join(', ')}`);
                 });
             } else {
@@ -237,7 +260,7 @@ export class ConverseAgent {
 
         if (stopReason === 'end_turn' || stopReason === 'stop_sequence') {
             // Add the response message to the conversation history
-            this.messages.push(response.output.message);
+            await this.messageStorage.addMessage(this.session, response.output.message);
 
             try {
                 const message = response.output.message;
@@ -274,7 +297,7 @@ export class ConverseAgent {
 
             try {
                 // First, add the assistant message with toolUse to the conversation history
-                this.messages.push(response.output.message);
+                await this.messageStorage.addMessage(this.session, response.output.message);
 
                 // Process each tool use and collect results
                 const toolResults = [];
@@ -318,14 +341,11 @@ export class ConverseAgent {
 
                 // Add a user message with the tool results
                 if (toolResults.length > 0) {
-                    const userMessageWithToolResults: {
-                        role: "user";
-                        content: any[];
-                    } = {
+                    const userMessageWithToolResults: Message = {
                         role: "user",
                         content: toolResults
                     };
-                    this.messages.push(userMessageWithToolResults);
+                    await this.messageStorage.addMessage(this.session, userMessageWithToolResults);
 
                     // Now get the next response from the model
                     const nextResponse = await this._getConverseResponse();
@@ -339,7 +359,7 @@ export class ConverseAgent {
             }
         } else if (stopReason === 'max_tokens') {
             // Add the response message to the conversation history
-            this.messages.push(response.output.message);
+            await this.messageStorage.addMessage(this.session, response.output.message);
 
             // Continue the conversation if the token limit is reached
             return await this.invokeWithPrompt('Please continue.');

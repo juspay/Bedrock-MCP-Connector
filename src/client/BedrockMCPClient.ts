@@ -4,6 +4,12 @@ import { ConverseAgent } from "../core/ConverseAgent.js";
 import { ToolManager } from "../core/ToolManager.js";
 import { LogLevel } from "../utils/logging.js";
 import { BedrockMCPClientConfig, BedrockMCPClientEmitter, ToolHandler } from "../types.js";
+import {
+    MessageStorage,
+    InMemoryMessageStorage,
+    RedisMessageStorage,
+    SessionIdentifier
+} from "../storage/index.js";
 
 /**
  * Client for interacting with AWS Bedrock and MCP servers
@@ -11,6 +17,7 @@ import { BedrockMCPClientConfig, BedrockMCPClientEmitter, ToolHandler } from "..
 export class BedrockMCPClient {
     private agent: ConverseAgent;
     private toolManager: ToolManager;
+    private messageStorage: MessageStorage;
     private mcpClient: MCPClient | null = null;
     private mcpServerUrl: string | null = null;
     private clientName: string;
@@ -20,12 +27,21 @@ export class BedrockMCPClient {
 
     /**
      * Create a new BedrockMCPClient
-     * 
+     *
      * @param config - Configuration options
      */
     constructor(config: BedrockMCPClientConfig) {
         // Initialize the tool manager
         this.toolManager = new ToolManager();
+
+        // Initialize storage based on configuration
+        this.messageStorage = this.createStorage(config);
+
+        // Create session identifier
+        const session: SessionIdentifier = {
+            sessionId: config.sessionId || this.generateSessionId(),
+            userId: config.userId
+        };
 
         // Initialize the agent
         this.agent = new ConverseAgent(config.modelId, {
@@ -35,6 +51,8 @@ export class BedrockMCPClient {
             responseOutputTags: config.responseOutputTags,
             maxTokens: config.maxTokens,
             temperature: config.temperature,
+            messageStorage: this.messageStorage,
+            session: session
         });
 
         // Store MCP configuration
@@ -44,6 +62,40 @@ export class BedrockMCPClient {
 
         // Initialize event emitter
         this.emitter = new EventEmitter() as BedrockMCPClientEmitter;
+
+        // Initialize storage
+        this.initializeStorage();
+    }
+
+    /**
+     * Create storage instance based on configuration
+     */
+    private createStorage(config: BedrockMCPClientConfig): MessageStorage {
+        if (!config.storage || config.storage.type === 'memory') {
+            return new InMemoryMessageStorage();
+        } else if (config.storage.type === 'redis') {
+            return new RedisMessageStorage(config.storage.config);
+        } else {
+            throw new Error(`Unsupported storage type: ${(config.storage as any).type}`);
+        }
+    }
+
+    /**
+     * Initialize storage connection
+     */
+    private async initializeStorage(): Promise<void> {
+        try {
+            await this.messageStorage.initialize();
+        } catch (error) {
+            this.emitter.emit("error", new Error(`Failed to initialize storage: ${error instanceof Error ? error.message : String(error)}`));
+        }
+    }
+
+    /**
+     * Generate a unique session ID
+     */
+    private generateSessionId(): string {
+        return `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     }
 
     /**
@@ -86,8 +138,8 @@ export class BedrockMCPClient {
     }
 
     /**
-     * Disconnect from the MCP server
-     * 
+     * Disconnect from the MCP server and close storage
+     *
      * @returns A promise that resolves when the connection is closed
      */
     async disconnect(): Promise<void> {
@@ -103,6 +155,14 @@ export class BedrockMCPClient {
                 this.emitter.emit("error", new Error(`Error disconnecting from MCP server: ${errorMessage}`));
                 throw error;
             }
+        }
+
+        // Close storage connection
+        try {
+            await this.messageStorage.close();
+        } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            this.emitter.emit("error", new Error(`Error closing storage: ${errorMessage}`));
         }
     }
 
@@ -198,23 +258,23 @@ export class BedrockMCPClient {
 
     /**
      * Get the conversation history
-     * 
+     *
      * @returns The conversation history
      */
-    getConversationHistory() {
-        return this.agent.getConversationHistory();
+    async getConversationHistory() {
+        return await this.agent.getConversationHistory();
     }
 
     /**
      * Clear the conversation history
      */
-    clearConversationHistory(): void {
-        this.agent.clearConversationHistory();
+    async clearConversationHistory(): Promise<void> {
+        await this.agent.clearConversationHistory();
     }
 
     /**
      * Set the log level for the client and its components
-     * 
+     *
      * @param level - The log level to set
      */
     setLogLevel(level: LogLevel): void {
@@ -222,6 +282,39 @@ export class BedrockMCPClient {
         // These properties are private, but we know they exist from our implementation
         (this.agent as any).logger?.setLevel(level);
         (this.toolManager as any).logger?.setLevel(level);
+        
+        // Set log level for storage if it supports it
+        if (this.messageStorage && typeof (this.messageStorage as any).setLogLevel === 'function') {
+            (this.messageStorage as any).setLogLevel(level);
+        }
+    }
+
+    /**
+     * Get storage health status
+     *
+     * @returns True if storage is healthy
+     */
+    async isStorageHealthy(): Promise<boolean> {
+        try {
+            return await this.messageStorage.isHealthy();
+        } catch (error) {
+            return false;
+        }
+    }
+
+    /**
+     * Get storage type information
+     *
+     * @returns Storage type and additional info
+     */
+    getStorageInfo(): { type: string; isHealthy?: boolean } {
+        if (this.messageStorage instanceof InMemoryMessageStorage) {
+            return { type: 'memory' };
+        } else if (this.messageStorage instanceof RedisMessageStorage) {
+            return { type: 'redis' };
+        } else {
+            return { type: 'unknown' };
+        }
     }
 
     /**

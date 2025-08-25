@@ -57,6 +57,90 @@ if (client.isConnectedToMCP()) {
 }
 ```
 
+### Using Redis for Persistent Storage
+
+The package supports both in-memory and Redis storage for conversation history:
+
+```typescript
+import { BedrockMCPClient } from "@juspay/bedrock-mcp-connector";
+
+// Using Redis storage for persistent conversations
+const client = new BedrockMCPClient({
+  modelId: "anthropic.claude-3-sonnet-20240229-v1:0",
+  region: "us-east-1",
+  sessionId: "user-session-123", // Unique session identifier
+  userId: "user-456", // Optional user identifier
+  storage: {
+    type: "redis",
+    config: {
+      host: "localhost",
+      port: 6379,
+      password: "your-redis-password", // Optional
+      db: 0, // Redis database number
+      keyPrefix: "bedrock-mcp:", // Key prefix for Redis keys
+      ttl: 86400, // TTL in seconds (24 hours)
+      connectionOptions: {
+        connectTimeout: 5000,
+        lazyConnect: true
+      }
+    }
+  }
+});
+
+// Conversations are now persistent across client restarts
+const response = await client.sendPrompt("Remember this: my favorite color is blue");
+console.log("Response:", response);
+
+// Later, in a new client instance with the same sessionId...
+const newClient = new BedrockMCPClient({
+  modelId: "anthropic.claude-3-sonnet-20240229-v1:0",
+  region: "us-east-1",
+  sessionId: "user-session-123", // Same session ID
+  storage: { type: "redis", config: { /* same config */ } }
+});
+
+const response2 = await newClient.sendPrompt("What's my favorite color?");
+// The model will remember the previous conversation!
+```
+
+### Storage Configuration Options
+
+#### In-Memory Storage (Default)
+```typescript
+const client = new BedrockMCPClient({
+  modelId: "anthropic.claude-3-sonnet-20240229-v1:0",
+  region: "us-east-1",
+  // No storage config = in-memory storage
+  // OR explicitly specify:
+  storage: { type: "memory" }
+});
+```
+
+#### Redis Storage
+```typescript
+const client = new BedrockMCPClient({
+  modelId: "anthropic.claude-3-sonnet-20240229-v1:0",
+  region: "us-east-1",
+  storage: {
+    type: "redis",
+    config: {
+      host: "localhost",        // Redis host (default: 'localhost')
+      port: 6379,              // Redis port (default: 6379)
+      password: "password",    // Redis password (optional)
+      db: 0,                   // Redis database (default: 0)
+      keyPrefix: "myapp:",     // Key prefix (default: 'bedrock-mcp:conversation:')
+      ttl: 3600,              // TTL in seconds (default: 86400 - 24 hours)
+      connectionOptions: {     // Additional Redis connection options
+        connectTimeout: 5000,
+        lazyConnect: true,
+        retryDelayOnFailover: 100,
+        maxRetriesPerRequest: 3
+      }
+    }
+  }
+});
+```
+
 ### With Event Listeners
 
 ```typescript
@@ -558,6 +642,76 @@ Options:
   -h, --help                 Show this help message
 ```
 
+## Session Management and Multi-User Support
+
+The package supports sophisticated session management for multi-user applications:
+
+### Session Isolation
+```typescript
+// User 1's conversation
+const user1Client = new BedrockMCPClient({
+  modelId: "anthropic.claude-3-sonnet-20240229-v1:0",
+  region: "us-east-1",
+  sessionId: "session-user1-chat1",
+  userId: "user1",
+  storage: { type: "redis", config: { /* redis config */ } }
+});
+
+// User 2's conversation (completely isolated)
+const user2Client = new BedrockMCPClient({
+  modelId: "anthropic.claude-3-sonnet-20240229-v1:0",
+  region: "us-east-1",
+  sessionId: "session-user2-chat1",
+  userId: "user2",
+  storage: { type: "redis", config: { /* redis config */ } }
+});
+```
+
+### Storage Health Monitoring
+```typescript
+// Check if storage is healthy
+const isHealthy = await client.isStorageHealthy();
+if (!isHealthy) {
+  console.log("Storage connection issues detected");
+}
+
+// Get storage information
+const storageInfo = client.getStorageInfo();
+console.log("Storage type:", storageInfo.type); // 'memory' or 'redis'
+```
+
+### Redis Key Management
+
+When using Redis storage, keys are structured as follows:
+- Pattern: `{keyPrefix}{userId}:{sessionId}` or `{keyPrefix}{sessionId}`
+- Default prefix: `bedrock-mcp:conversation:`
+- Example keys:
+  - `bedrock-mcp:conversation:user123:session456`
+  - `bedrock-mcp:conversation:anonymous-session789`
+
+### Storage Migration
+
+You can migrate between storage types by copying conversation history:
+
+```typescript
+// Get history from in-memory client
+const memoryClient = new BedrockMCPClient({
+  modelId: "anthropic.claude-3-sonnet-20240229-v1:0",
+  storage: { type: "memory" }
+});
+
+const history = await memoryClient.getConversationHistory();
+
+// Create Redis client and restore history
+const redisClient = new BedrockMCPClient({
+  modelId: "anthropic.claude-3-sonnet-20240229-v1:0",
+  storage: { type: "redis", config: { /* config */ } }
+});
+
+// Note: Direct history restoration requires custom implementation
+// The storage layer handles this automatically for same-session clients
+```
+
 ## API Reference
 
 ### BedrockMCPClient
@@ -575,22 +729,63 @@ new BedrockMCPClient(config: {
   maxTokens?: number;
   temperature?: number;
   responseOutputTags?: [string, string];
+  storage?: StorageConfig;
+  sessionId?: string;
+  userId?: string;
 })
 ```
 
 #### Methods
 
 - `connect(): Promise<void>` - Connect to the MCP server
-- `disconnect(): Promise<void>` - Disconnect from the MCP server
+- `disconnect(): Promise<void>` - Disconnect from the MCP server and close storage
 - `isConnectedToMCP(): boolean` - Check if the client is connected to the MCP server
 - `sendPrompt(prompt: string): Promise<string>` - Send a prompt to the agent
 - `registerTool(name: string, handler: ToolHandler, description?: string, inputSchema?: Record<string, any>): void` - Register a custom tool
 - `getTools(): Array<{ name: string; description?: string }>` - Get all registered tools
 - `getEmitter(): BedrockMCPClientEmitter` - Get the event emitter
 - `getAgent(): ConverseAgent` - Get the agent
-- `getConversationHistory()` - Get the conversation history
-- `clearConversationHistory(): void` - Clear the conversation history
+- `getConversationHistory(): Promise<Message[]>` - Get the conversation history
+- `clearConversationHistory(): Promise<void>` - Clear the conversation history
 - `setLogLevel(level: LogLevel): void` - Set the log level for the client and its components
+- `isStorageHealthy(): Promise<boolean>` - Check if storage is healthy
+- `getStorageInfo(): { type: string; isHealthy?: boolean }` - Get storage type information
+
+### Storage Types
+
+#### StorageConfig
+```typescript
+type StorageConfig =
+  | { type: 'memory' }
+  | { type: 'redis'; config: RedisStorageConfig };
+```
+
+#### RedisStorageConfig
+```typescript
+interface RedisStorageConfig {
+  host?: string;                    // Redis host (default: 'localhost')
+  port?: number;                    // Redis port (default: 6379)
+  password?: string;                // Redis password
+  db?: number;                      // Redis database number (default: 0)
+  keyPrefix?: string;               // Key prefix (default: 'bedrock-mcp:conversation:')
+  ttl?: number;                     // TTL in seconds (default: 86400)
+  connectionOptions?: {             // Additional Redis connection options
+    connectTimeout?: number;
+    lazyConnect?: boolean;
+    retryDelayOnFailover?: number;
+    maxRetriesPerRequest?: number;
+    [key: string]: any;
+  };
+}
+```
+
+#### SessionIdentifier
+```typescript
+interface SessionIdentifier {
+  sessionId: string;                // Unique session ID
+  userId?: string;                  // Optional user ID for multi-user scenarios
+}
+```
 
 ### Events
 
